@@ -1,0 +1,16 @@
+[package]
+name = "litework-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live capture sources for LiteWork (AF_PACKET, BPF, Npcap)"
+
+[dependencies]
+litework-core = { path = "../litework-core" }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"

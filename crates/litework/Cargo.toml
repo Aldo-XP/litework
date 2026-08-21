@@ -1,0 +1,23 @@
+[package]
+name = "litework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Low-overhead pcap analysis TUI - virtualizes huge captures for fast correlation"
+readme = "../../README.md"
+keywords = ["pcap", "network", "packet", "analysis", "tui"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+litework-core = { path = "../litework-core" }
+litework-capture = { path = "../litework-capture" }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+ahash = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

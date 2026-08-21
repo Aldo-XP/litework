@@ -1,0 +1,13 @@
+# build output
+/target/
+/dist/
+
+# LiteWork runtime artifacts
+*.lwix
+litework-export-*.pcap
+litework-*.pcap
+
+# editor / OS
+.swp
+*.swp
+.DS_Store

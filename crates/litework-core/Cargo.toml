@@ -1,0 +1,16 @@
+[package]
+name = "litework-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless engine for LiteWork: pcap virtualization, dissection, columnar index, query"
+
+[dependencies]
+pcap-parser = { workspace = true }
+etherparse = { workspace = true }
+memmap2 = { workspace = true }
+lz4_flex = { workspace = true }
+crossbeam-channel = { workspace = true }
+ahash = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
