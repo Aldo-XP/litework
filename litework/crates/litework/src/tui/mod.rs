@@ -2,6 +2,7 @@
 //! The packet list is virtual — rows are fetched on demand by walking from the
 //! nearest row-group boundary, so scrolling a 100M-packet capture stays flat.
 
+mod bytes_tab;
 pub mod live;
 mod overview;
 pub mod packets;
@@ -28,6 +29,7 @@ pub enum Tab {
     Macs,
     Ports,
     Flows,
+    Bytes,
 }
 
 pub struct Filter {
@@ -57,6 +59,9 @@ pub struct App {
     pub filter_error: Option<String>,
     pub detail: bool,
     pub detail_scroll: u16,
+    /// A byte range picked by clicking hex/ASCII or a dissection field, kept
+    /// only while `cursor` still points at the packet it was picked from.
+    pub detail_selected: Option<(u64, std::ops::Range<usize>)>,
     pub window: packets::Window,
     /// Transient status line (e.g. after saving an export).
     pub status: Option<String>,
@@ -79,6 +84,12 @@ pub struct App {
     pub quit_confirm: bool,
     /// Screen regions from the last draw, for mouse hit-testing.
     pub regions: Regions,
+    /// BYTES tab state (cross-packet byte/bit reverse-engineering grid).
+    pub bytes_tab: bytes_tab::State,
+    /// A loaded Kaitai Struct spec (id, parsed spec) — drives auto-decoded
+    /// fields in both the BYTES tab and the PACKETS detail pane, loaded via
+    /// the BYTES tab's `L` key. Session-wide, not tied to a specific filter.
+    pub loaded_ksy: Option<(String, litework_core::kaitai::Spec)>,
     quit: bool,
 }
 
@@ -106,6 +117,7 @@ impl App {
             filter_error: None,
             detail: false,
             detail_scroll: 0,
+            detail_selected: None,
             window: packets::Window::default(),
             status: None,
             macs_scroll: tables::Scroll::default(),
@@ -120,6 +132,8 @@ impl App {
             save_input: None,
             quit_confirm: false,
             regions: Regions::default(),
+            bytes_tab: bytes_tab::State::default(),
+            loaded_ksy: None,
             quit: false,
         }
     }
@@ -190,7 +204,7 @@ fn drain_live(app: &mut App) {
                 // (avoids rescanning the growing spool on every rebuild).
                 live.agg.add(&rec, &meta);
                 if let Some(fl) = &mut app.filter {
-                    if fl.expr.matches(&meta, &rec) {
+                    if fl.expr.matches(&meta, &rec, &data) {
                         fl.stats.add(&rec, &meta);
                         if fl.matches.len() < FILTER_CAP {
                             fl.matches.push(rec);
@@ -378,16 +392,18 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 Tab::Packets => Tab::Macs,
                 Tab::Macs => Tab::Ports,
                 Tab::Ports => Tab::Flows,
-                Tab::Flows => Tab::Overview,
+                Tab::Flows => Tab::Bytes,
+                Tab::Bytes => Tab::Overview,
             }
         }
         (KeyCode::BackTab, _) => {
             app.tab = match app.tab {
-                Tab::Overview => Tab::Flows,
+                Tab::Overview => Tab::Bytes,
                 Tab::Packets => Tab::Overview,
                 Tab::Macs => Tab::Packets,
                 Tab::Ports => Tab::Macs,
                 Tab::Flows => Tab::Ports,
+                Tab::Bytes => Tab::Flows,
             }
         }
         (KeyCode::Char(' '), _) if app.live.is_some() => {
@@ -407,9 +423,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         (KeyCode::Char('3'), _) => app.tab = Tab::Macs,
         (KeyCode::Char('4'), _) => app.tab = Tab::Ports,
         (KeyCode::Char('5'), _) => app.tab = Tab::Flows,
+        (KeyCode::Char('6'), _) => app.tab = Tab::Bytes,
         _ => match app.tab {
             Tab::Packets => packets::handle_key(app, code),
             Tab::Macs | Tab::Ports | Tab::Flows => tables::handle_key(app, app.tab, code),
+            Tab::Bytes => bytes_tab::handle_key(app, code),
             Tab::Overview => {}
         },
     }
@@ -470,7 +488,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                             if up { KeyCode::Up } else { KeyCode::Down },
                         );
                     }
-                    Tab::Overview => {}
+                    Tab::Overview | Tab::Bytes => {}
                 }
             }
         }
@@ -488,6 +506,27 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     Some(app.filter.as_ref().map(|f| f.source.clone()).unwrap_or_default());
                 return;
             }
+            // Detail pane: click a hex/ASCII byte or a dissection row to see
+            // (and highlight) what field it belongs to, in both directions.
+            if app.detail && app.tab == Tab::Packets && inside(app.regions.detail) {
+                if let Some((rec, meta)) = app.window.get(app.cursor).copied() {
+                    let (sum_area, hex_area) = packets::detail_split(app.regions.detail);
+                    let data = app.file.bytes(&rec);
+                    let rows = packets::detail_rows(app.cursor, &rec, &meta, data, app.loaded_ksy.as_ref());
+                    let hit = if inside(hex_area) && m.column > hex_area.x && m.row > hex_area.y {
+                        let col = m.column - hex_area.x - 1;
+                        let row = m.row - hex_area.y - 1;
+                        packets::detail_hit(&rows, data, true, col, row, app.detail_scroll)
+                    } else if inside(sum_area) && m.column > sum_area.x && m.row > sum_area.y {
+                        let row = m.row - sum_area.y - 1;
+                        packets::detail_hit(&rows, data, false, 0, row, 0)
+                    } else {
+                        None
+                    };
+                    app.detail_selected = hit.map(|r| (app.cursor, r));
+                }
+                return;
+            }
             // Row selection inside the table body.
             if inside(app.regions.body) && m.row >= app.regions.body.y + 2 {
                 let row = (m.row - app.regions.body.y - 2) as u64;
@@ -503,6 +542,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                                 // toggle the dissection/hex detail pane.
                                 app.detail = !app.detail;
                                 app.detail_scroll = 0;
+                                app.detail_selected = None;
                             } else {
                                 app.cursor = target;
                             }
@@ -511,7 +551,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     Tab::Macs => tables::click_row(app, Tab::Macs, row as usize),
                     Tab::Ports => tables::click_row(app, Tab::Ports, row as usize),
                     Tab::Flows => tables::click_row(app, Tab::Flows, row as usize),
-                    Tab::Overview => {}
+                    Tab::Overview | Tab::Bytes => {}
                 }
             }
         }
@@ -522,8 +562,8 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 /// Which tab lives at column offset `x` in the tab strip.
 /// Mirrors ratatui's Tabs layout: " title │ title │ ..." (1-space padding).
 fn tab_at(x: u16) -> Option<Tab> {
-    let titles = ["1 OVERVIEW", "2 PACKETS", "3 MACS", "4 PORTS", "5 FLOWS"];
-    let tabs = [Tab::Overview, Tab::Packets, Tab::Macs, Tab::Ports, Tab::Flows];
+    let titles = ["1 OVERVIEW", "2 PACKETS", "3 MACS", "4 PORTS", "5 FLOWS", "6 BYTES"];
+    let tabs = [Tab::Overview, Tab::Packets, Tab::Macs, Tab::Ports, Tab::Flows, Tab::Bytes];
     let mut pos = 0u16;
     for (i, t) in titles.iter().enumerate() {
         let w = t.len() as u16 + 2; // one space padding each side
@@ -543,13 +583,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
-    let titles = ["1 OVERVIEW", "2 PACKETS", "3 MACS", "4 PORTS", "5 FLOWS"];
+    let titles = ["1 OVERVIEW", "2 PACKETS", "3 MACS", "4 PORTS", "5 FLOWS", "6 BYTES"];
     let sel = match app.tab {
         Tab::Overview => 0,
         Tab::Packets => 1,
         Tab::Macs => 2,
         Tab::Ports => 3,
         Tab::Flows => 4,
+        Tab::Bytes => 5,
     };
     let stats = &app.index.stats;
     let right = match &app.live {
@@ -604,6 +645,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Tab::Overview => overview::draw(f, app, body),
         Tab::Packets => packets::draw(f, app, body),
         Tab::Macs | Tab::Ports | Tab::Flows => tables::draw(f, app, app.tab, body),
+        Tab::Bytes => bytes_tab::draw(f, app, body),
     }
 
     let hint = if app.filter_input.is_some() {
@@ -616,6 +658,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Tab::Packets => "↑↓/pgup/pgdn/g/G: move   enter: detail   /: filter   w: save to pcap   ?: help   esc: clear   tab: switch   q: quit",
             Tab::Ports | Tab::Macs => "↑↓/pgup/pgdn/g/G: move   enter: pivot   v: flows/totals   ?: filter help   tab/1-5: switch   q: quit",
             Tab::Flows => "↑↓/pgup/pgdn/g/G: move   enter: pivot to packets   ?: filter help   tab/1-5: switch   q: quit",
+            Tab::Bytes => "hl/jk: move   b: bit-mode   v: select   c: cycle type   enter: tag   u: undo   d: delete   s: sandbox   x: export   L: load .ksy   f: jump to payload   tab/1-6: switch   q: quit",
         }
     };
     f.render_widget(
@@ -634,7 +677,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let _ = Block::new().borders(Borders::NONE); // keep import used
 }
 
-fn draw_prompt(f: &mut Frame, screen: Rect, title: &str, buf: &str) {
+pub(crate) fn draw_prompt(f: &mut Frame, screen: Rect, title: &str, buf: &str) {
     use ratatui::widgets::{Clear, Paragraph};
     let w = (buf.len() as u16 + 8).clamp(40, screen.width.saturating_sub(4));
     let area = Rect::new(

@@ -111,7 +111,7 @@ pub fn run(
                 None
             };
             let keep = match (&expr, &meta) {
-                (Some(e), Some(m)) => e.matches(m, &rec),
+                (Some(e), Some(m)) => e.matches(m, &rec, p.data),
                 _ => true,
             };
             if keep {

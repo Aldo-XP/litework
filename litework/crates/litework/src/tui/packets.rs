@@ -4,12 +4,13 @@
 
 use super::{App, Filter, FILTER_CAP};
 use crossterm::event::KeyCode;
-use litework_core::dissect::dissect;
+use litework_core::dissect::{dissect, field_spans};
 use litework_core::query::run_query;
 use litework_core::PcapWriter;
 use litework_core::types::{fmt_mac, fmt_net_addr, fmt_ts, fmt_ts_short, NetAddrs, PacketMeta, PacketRecord, ProtoKey};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use std::ops::Range;
 
 /// A fetched, dissected run of consecutive rows (the visible slice + margin).
 #[derive(Default)]
@@ -26,7 +27,7 @@ impl Window {
         first >= self.start_row && last < self.start_row + self.rows.len() as u64
     }
 
-    fn get(&self, row: u64) -> Option<&(PacketRecord, PacketMeta)> {
+    pub(crate) fn get(&self, row: u64) -> Option<&(PacketRecord, PacketMeta)> {
         self.rows.get(row.checked_sub(self.start_row)? as usize)
     }
 }
@@ -164,6 +165,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Esc => {
             if app.detail {
                 app.detail = false;
+                app.detail_selected = None;
             } else {
                 apply_filter(app, "");
             }
@@ -171,6 +173,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Enter => {
             app.detail = !app.detail;
             app.detail_scroll = 0;
+            app.detail_selected = None;
         }
         KeyCode::Up | KeyCode::Char('k') => app.cursor = app.cursor.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => app.cursor = (app.cursor + 1).min(last),
@@ -457,86 +460,203 @@ fn draw_filter_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
-    let Some((rec, meta)) = app.window.get(app.cursor) else {
-        return;
-    };
-    let data = app.file.bytes(rec);
-    let [sum_area, hex_area] =
-        Layout::horizontal([Constraint::Length(38), Constraint::Min(20)]).areas(area);
+/// One row of the dissection summary: a label/value pair, and — when it
+/// corresponds to a run of raw bytes — the byte range those bytes occupy in
+/// the frame. Shared by `draw_detail` (rendering) and mouse hit-testing, so
+/// the two views can never drift apart.
+pub struct DetailRow {
+    pub key: String,
+    pub value: String,
+    pub span: Option<Range<usize>>,
+}
 
-    // Dissection summary.
-    let mut lines = vec![
-        kv("packet", &app.cursor.to_string()),
-        kv("time", &fmt_ts(rec.ts_nanos)),
-        kv("offset", &format!("0x{:x}", rec.data_offset)),
-        kv("caplen/len", &format!("{}/{}", rec.caplen, rec.origlen)),
-        kv("linktype", &rec.linktype.to_string()),
-    ];
+/// Build the dissection summary rows for the packet at `cursor`, cross-
+/// referenced against `field_spans` so each field knows its own byte range.
+/// When `ksy` is loaded (BYTES tab's `L` key), its interpreted fields are
+/// appended after the built-in ones, anchored at the same payload boundary
+/// — same mechanism, same click-link, no Kaitai-specific rendering needed.
+pub fn detail_rows(
+    cursor: u64,
+    rec: &PacketRecord,
+    meta: &PacketMeta,
+    data: &[u8],
+    ksy: Option<&(String, litework_core::kaitai::Spec)>,
+) -> Vec<DetailRow> {
+    let spans = field_spans(rec.linktype, data);
+    let find = |label: &str| spans.iter().find(|s| s.label == label).map(|s| s.range.clone());
+    let mut rows = Vec::new();
+    let mut push = |key: &'static str, value, span| rows.push(DetailRow { key: key.to_string(), value, span });
+    push("packet", cursor.to_string(), None);
+    push("time", fmt_ts(rec.ts_nanos), None);
+    push("offset", format!("0x{:x}", rec.data_offset), None);
+    push("caplen/len", format!("{}/{}", rec.caplen, rec.origlen), None);
+    push("linktype", rec.linktype.to_string(), None);
     if meta.has_eth {
-        lines.push(kv("eth src", &fmt_mac(&meta.mac_src)));
-        lines.push(kv("eth dst", &fmt_mac(&meta.mac_dst)));
-        lines.push(kv("ethertype", &format!("0x{:04x}", meta.ethertype)));
+        push("eth src", fmt_mac(&meta.mac_src), find("eth src"));
+        push("eth dst", fmt_mac(&meta.mac_dst), find("eth dst"));
+        push("ethertype", format!("0x{:04x}", meta.ethertype), find("ethertype"));
     }
     if let Some(v) = meta.vlan {
-        lines.push(kv("vlan", &v.to_string()));
+        push("vlan", v.to_string(), find("vlan"));
     }
     let (src, dst) = fmt_net_addr(&meta.net);
     if !matches!(meta.net, NetAddrs::None) {
-        lines.push(kv("ip src", &src));
-        lines.push(kv("ip dst", &dst));
+        push("ip src", src, find("ip src"));
+        push("ip dst", dst, find("ip dst"));
     }
     if let Some(p) = meta.ip_proto {
-        lines.push(kv("ip proto", &format!("{} ({})", p, ProtoKey::Ip(p).name())));
+        push("ip proto", format!("{} ({})", p, ProtoKey::Ip(p).name()), find("ip proto"));
     }
     if let (Some(s), Some(d)) = (meta.sport, meta.dport) {
         let svc = |p: u16| match litework_core::services::service_name(p) {
             Some(n) => format!("{p} ({n})"),
             None => p.to_string(),
         };
-        lines.push(kv("ports", &format!("{} → {}", svc(s), svc(d))));
+        push("ports", format!("{} → {}", svc(s), svc(d)), find("ports"));
     }
     if let Some(fl) = meta.tcp_flags {
-        lines.push(kv("tcp flags", &tcp_flags_str(fl)));
+        push("tcp flags", tcp_flags_str(fl), find("tcp flags"));
     }
+
+    if let Some((_, spec)) = ksy {
+        let payload_start = find("payload").map(|r| r.start).unwrap_or(data.len());
+        let payload = data.get(payload_start..).unwrap_or(&[]);
+        for f in litework_core::kaitai::interpret(spec, payload) {
+            let value = litework_core::annotate::decode(&f.kind, f.bit_start, f.bit_len, payload);
+            let start = payload_start + f.bit_start / 8;
+            let end = payload_start + (f.bit_start + f.bit_len).div_ceil(8);
+            rows.push(DetailRow { key: f.name, value, span: Some(start..end) });
+        }
+    }
+
+    rows
+}
+
+/// Split the detail pane into (dissection summary, hex dump) — used by both
+/// drawing and mouse hit-testing so they always agree on the geometry.
+pub fn detail_split(area: Rect) -> (Rect, Rect) {
+    let [sum_area, hex_area] =
+        Layout::horizontal([Constraint::Length(38), Constraint::Min(20)]).areas(area);
+    (sum_area, hex_area)
+}
+
+/// Byte width of one hex-dump line's "xx xx xx ..." column (16 bytes, single
+/// spaces between, no trailing separator) — used to pad short last lines and
+/// to map a mouse click column back to a byte index.
+const HEX_COL_WIDTH: usize = 16 * 3 - 1;
+
+fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+    let Some((rec, meta)) = app.window.get(app.cursor) else {
+        return;
+    };
+    let data = app.file.bytes(rec);
+    let (sum_area, hex_area) = detail_split(area);
+    let selected = app
+        .detail_selected
+        .as_ref()
+        .filter(|(c, _)| *c == app.cursor)
+        .map(|(_, r)| r.clone());
+
+    // Dissection summary — the selected field's row (if any) is highlighted.
+    let rows = detail_rows(app.cursor, rec, meta, data, app.loaded_ksy.as_ref());
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|row| {
+            let hl = selected.is_some() && row.span == selected;
+            let kstyle = if hl { Style::new().bg(Color::Yellow).fg(Color::Black) } else { Style::new().dim() };
+            let vstyle = if hl { Style::new().bg(Color::Yellow).fg(Color::Black) } else { Style::new() };
+            Line::from(vec![
+                Span::styled(format!("{:<11}", row.key), kstyle),
+                Span::styled(row.value.clone(), vstyle),
+            ])
+        })
+        .collect();
     f.render_widget(
         Paragraph::new(lines).block(Block::new().borders(Borders::ALL).title(" dissection ")),
         sum_area,
     );
 
-    // Hex + ASCII dump (scroll with +/-).
+    // Hex + ASCII dump (scroll with +/-). Bytes covered by `selected` are
+    // highlighted in both the hex and ASCII columns.
     let mut hex_lines = Vec::new();
     for (i, chunk) in data.chunks(16).enumerate() {
-        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
-        let ascii: String = chunk
-            .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '·' })
-            .collect();
-        hex_lines.push(Line::from(vec![
-            Span::styled(format!("{:06x}  ", i * 16), Style::new().dim()),
-            Span::raw(format!("{:<47}  ", hex.join(" "))),
-            Span::styled(ascii, Style::new().fg(Color::Green)),
-        ]));
+        let base = i * 16;
+        let is_sel = |off: usize| selected.as_ref().is_some_and(|r| r.contains(&off));
+        let mut spans = vec![Span::styled(format!("{base:06x}  "), Style::new().dim())];
+        for (j, b) in chunk.iter().enumerate() {
+            let style = if is_sel(base + j) {
+                Style::new().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::new()
+            };
+            spans.push(Span::styled(format!("{b:02x}"), style));
+            if j + 1 < chunk.len() {
+                spans.push(Span::raw(" "));
+            }
+        }
+        let used = chunk.len() * 3 - if chunk.is_empty() { 0 } else { 1 };
+        spans.push(Span::raw(" ".repeat(HEX_COL_WIDTH.saturating_sub(used))));
+        spans.push(Span::raw("  "));
+        for (j, &b) in chunk.iter().enumerate() {
+            let ch = if (0x20..0x7f).contains(&b) { b as char } else { '·' };
+            let style = if is_sel(base + j) {
+                Style::new().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::new().fg(Color::Green)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        hex_lines.push(Line::from(spans));
     }
     let n = hex_lines.len();
     f.render_widget(
-        Paragraph::new(hex_lines)
-            .scroll((app.detail_scroll, 0))
-            .block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(format!(" raw bytes ({} B, +/- scroll, {n} lines) ", data.len())),
-            ),
+        Paragraph::new(hex_lines).scroll((app.detail_scroll, 0)).block(
+            Block::new().borders(Borders::ALL).title(format!(
+                " raw bytes ({} B, +/- scroll, {n} lines) — click a byte to inspect it ",
+                data.len()
+            )),
+        ),
         hex_area,
     );
 }
 
-
-fn kv(k: &str, v: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{k:<11}"), Style::new().dim()),
-        Span::raw(v.to_string()),
-    ])
+/// Map a mouse click inside the detail pane to a `DetailRow` (and its byte
+/// span, if any) — used for both the summary side and the hex/ASCII side.
+/// `col`/`row` are 0-based, relative to the *inside* of the bordered block
+/// (i.e. already offset past the top-left border).
+pub fn detail_hit(
+    rows: &[DetailRow],
+    data: &[u8],
+    in_hex: bool,
+    col: u16,
+    row: u16,
+    scroll: u16,
+) -> Option<Range<usize>> {
+    if in_hex {
+        let col = col as usize;
+        const PREFIX: usize = 8; // "xxxxxx  "
+        const ASCII_START: usize = PREFIX + HEX_COL_WIDTH + 2;
+        let byte_in_line = if (ASCII_START..ASCII_START + 16).contains(&col) {
+            col - ASCII_START
+        } else if col >= PREFIX {
+            (col - PREFIX) / 3
+        } else {
+            return None;
+        };
+        if byte_in_line >= 16 {
+            return None;
+        }
+        let line = row as usize + scroll as usize;
+        let offset = line * 16 + byte_in_line;
+        if offset >= data.len() {
+            return None;
+        }
+        rows.iter().find_map(|r| {
+            r.span.clone().filter(|s| s.contains(&offset))
+        })
+    } else {
+        rows.get(row as usize).and_then(|r| r.span.clone())
+    }
 }
 
 fn tcp_flags_str(f: u8) -> String {

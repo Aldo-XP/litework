@@ -9,7 +9,7 @@
 //!   op    := == != < > <= >=
 //!
 //! Fields: mac, mac_src, mac_dst, ip, ip_src, ip_dst, proto, port, sport,
-//!         dport, ethertype, vlan, len
+//!         dport, ethertype, vlan, len, data
 //! Values:
 //!   MAC       aa:bb:cc:dd:ee:ff, wildcard bytes aa:bb:*:*:*:01, prefix aa:bb:*
 //!   IPv4      10.0.0.1, wildcard octets 10.10.*.180, prefix 10.10.*,
@@ -17,6 +17,10 @@
 //!   IPv6      full addresses and CIDR fe80::/10
 //!   ports &c  numbers (dec or 0x hex) and ranges 5900-5910
 //!   proto     tcp, udp, icmp, arp, ... or an IP protocol number
+//!   data      `data contains "text"` (case-insensitive substring of the raw
+//!             frame bytes) or `data contains aa:bb:cc` (exact hex bytes) —
+//!             the Wireshark-Ctrl+F equivalent. Forces a full rescan: the
+//!             tier-0/column indexes only cover metadata, never payload.
 //!
 //! Execution prunes tier-0 row groups (never a false negative), then scans
 //! only surviving regions — from the column sidecar when present, otherwise
@@ -45,6 +49,8 @@ pub enum Field {
     Ethertype,
     Vlan,
     Len,
+    /// Raw frame bytes — only usable with the `contains` keyword.
+    Data,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +64,7 @@ pub enum CmpOp {
 }
 
 /// A typed comparison value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Mac([u8; 6]),
     /// Wildcarded MAC: matches when `addr & mask == pat`.
@@ -75,6 +81,9 @@ pub enum Value {
     Num(u64),
     /// Inclusive numeric range `lo-hi`.
     NumRange(u64, u64),
+    /// Byte pattern for `data contains ...` — a quoted string (ASCII,
+    /// case-insensitive) or colon-hex bytes (exact).
+    Bytes { pat: Vec<u8>, case_insensitive: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +105,7 @@ struct Lexer<'a> {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Ident(String),
+    Str(String),
     Op(&'static str),
     LParen,
     RParen,
@@ -117,6 +127,35 @@ impl<'a> Lexer<'a> {
         }
         if self.pos >= b.len() {
             return Ok(Tok::End);
+        }
+        if b[self.pos] == b'"' {
+            let mut i = self.pos + 1;
+            let mut buf = String::new();
+            loop {
+                if i >= b.len() {
+                    return Err(ParseError("unterminated string literal".into()));
+                }
+                match b[i] {
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    b'\\' if i + 1 < b.len() => {
+                        buf.push(match b[i + 1] {
+                            b'n' => '\n',
+                            b't' => '\t',
+                            c => c as char,
+                        });
+                        i += 2;
+                    }
+                    c => {
+                        buf.push(c as char);
+                        i += 1;
+                    }
+                }
+            }
+            self.pos = i;
+            return Ok(Tok::Str(buf));
         }
         let rest = &self.s[self.pos..];
         for (pat, tok) in [
@@ -241,6 +280,31 @@ fn parse_cmp(lx: &mut Lexer) -> Result<Expr, ParseError> {
             }
             Ok(Expr::Cmp(field, op, v))
         }
+        Tok::Ident(kw) if kw == "contains" => {
+            let v = match lx.next()? {
+                Tok::Str(s) => Value::Bytes {
+                    pat: s.into_bytes(),
+                    case_insensitive: true,
+                },
+                Tok::Ident(s) => Value::Bytes {
+                    pat: parse_hex_bytes(&s).ok_or_else(|| {
+                        ParseError(format!("'{s}' is not hex bytes (aa:bb:cc) or a quoted string"))
+                    })?,
+                    case_insensitive: false,
+                },
+                t => {
+                    return Err(ParseError(format!(
+                        "expected a quoted string or hex bytes after 'contains', got {t:?}"
+                    )))
+                }
+            };
+            if field != Field::Data {
+                return Err(ParseError(
+                    "'contains' only applies to the 'data' field".into(),
+                ));
+            }
+            Ok(Expr::Cmp(field, CmpOp::Eq, v))
+        }
         Tok::Ident(kw) if kw == "in" => {
             match lx.next()? {
                 Tok::LBrace => {}
@@ -280,6 +344,7 @@ fn parse_field(name: &str) -> Result<Field, ParseError> {
         "ethertype" => Field::Ethertype,
         "vlan" => Field::Vlan,
         "len" | "length" => Field::Len,
+        "data" | "payload" | "bytes" => Field::Data,
         other => return Err(ParseError(format!("unknown field '{other}'"))),
     })
 }
@@ -317,7 +382,23 @@ fn parse_value(field: Field, s: &str) -> Result<Value, ParseError> {
         Field::PortAny | Field::Sport | Field::Dport | Field::Ethertype | Field::Vlan
         | Field::Len => parse_num_or_range(s)
             .ok_or_else(|| ParseError(format!("'{s}' is not a number or range (lo-hi)"))),
+        Field::Data => Err(ParseError(
+            "field 'data' only supports 'contains' (e.g. data contains \"GET\")".into(),
+        )),
     }
+}
+
+/// Colon-hex bytes of any length, e.g. `47:45:54` — like a MAC pattern but
+/// without wildcards and not limited to 6 bytes.
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts
+        .iter()
+        .map(|p| (p.len() == 2).then(|| u8::from_str_radix(p, 16).ok()).flatten())
+        .collect()
 }
 
 pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -459,14 +540,29 @@ fn mac_masked_eq(addr: &[u8; 6], pat: &[u8; 6], mask: &[u8; 6]) -> bool {
 }
 
 impl Expr {
-    /// Exact per-packet predicate.
-    pub fn matches(&self, meta: &PacketMeta, rec: &PacketRecord) -> bool {
+    /// Exact per-packet predicate. `data` is the raw frame bytes — pass `&[]`
+    /// when the expression is known not to need them (see `needs_bytes`).
+    pub fn matches(&self, meta: &PacketMeta, rec: &PacketRecord, data: &[u8]) -> bool {
         match self {
-            Expr::And(a, b) => a.matches(meta, rec) && b.matches(meta, rec),
-            Expr::Or(a, b) => a.matches(meta, rec) || b.matches(meta, rec),
-            Expr::Not(e) => !e.matches(meta, rec),
-            Expr::In(f, vals) => vals.iter().any(|v| cmp_matches(*f, CmpOp::Eq, *v, meta, rec)),
-            Expr::Cmp(f, op, v) => cmp_matches(*f, *op, *v, meta, rec),
+            Expr::And(a, b) => a.matches(meta, rec, data) && b.matches(meta, rec, data),
+            Expr::Or(a, b) => a.matches(meta, rec, data) || b.matches(meta, rec, data),
+            Expr::Not(e) => !e.matches(meta, rec, data),
+            Expr::In(f, vals) => vals
+                .iter()
+                .any(|v| cmp_matches(*f, CmpOp::Eq, v.clone(), meta, rec, data)),
+            Expr::Cmp(f, op, v) => cmp_matches(*f, *op, v.clone(), meta, rec, data),
+        }
+    }
+
+    /// True when this filter examines raw frame bytes (`data contains ...`),
+    /// which the tier-0/column indexes don't cover — such filters force a
+    /// full rescan instead of the fast column path.
+    pub fn needs_bytes(&self) -> bool {
+        match self {
+            Expr::And(a, b) | Expr::Or(a, b) => a.needs_bytes() || b.needs_bytes(),
+            Expr::Not(e) => e.needs_bytes(),
+            Expr::In(f, _) => *f == Field::Data,
+            Expr::Cmp(f, _, _) => *f == Field::Data,
         }
     }
 
@@ -480,13 +576,31 @@ impl Expr {
             Expr::Not(_) => true,
             Expr::In(f, vals) => vals
                 .iter()
-                .any(|v| cmp_may_match_group(*f, CmpOp::Eq, *v, g, dict)),
-            Expr::Cmp(f, op, v) => cmp_may_match_group(*f, *op, *v, g, dict),
+                .any(|v| cmp_may_match_group(*f, CmpOp::Eq, v.clone(), g, dict)),
+            Expr::Cmp(f, op, v) => cmp_may_match_group(*f, *op, v.clone(), g, dict),
         }
     }
 }
 
-fn cmp_matches(field: Field, op: CmpOp, v: Value, meta: &PacketMeta, rec: &PacketRecord) -> bool {
+fn bytes_contains(hay: &[u8], pat: &[u8], case_insensitive: bool) -> bool {
+    if pat.is_empty() || pat.len() > hay.len() {
+        return pat.is_empty();
+    }
+    if case_insensitive {
+        hay.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat))
+    } else {
+        hay.windows(pat.len()).any(|w| w == pat)
+    }
+}
+
+fn cmp_matches(
+    field: Field,
+    op: CmpOp,
+    v: Value,
+    meta: &PacketMeta,
+    rec: &PacketRecord,
+    data: &[u8],
+) -> bool {
     let eq = |b: bool| match op {
         CmpOp::Eq => b,
         CmpOp::Ne => !b,
@@ -543,6 +657,9 @@ fn cmp_matches(field: Field, op: CmpOp, v: Value, meta: &PacketMeta, rec: &Packe
         (Field::Len, Value::Num(n)) => num_cmp(op, Some(rec.origlen as u64), n),
         (Field::Len, Value::NumRange(lo, hi)) => {
             eq((rec.origlen as u64) >= lo && (rec.origlen as u64) <= hi)
+        }
+        (Field::Data, Value::Bytes { pat, case_insensitive }) => {
+            eq(bytes_contains(data, &pat, case_insensitive))
         }
         _ => false,
     }
@@ -646,7 +763,9 @@ pub fn run_query(
         groups_scanned: 0,
         packets_scanned: 0,
     };
-    if index.sidecar.is_some() {
+    // The column store has no raw payload bytes, so a `data contains` filter
+    // always forces the rescan path below, sidecar or not.
+    if index.sidecar.is_some() && !expr.needs_bytes() {
         // Column path: decompress surviving groups, no pcap access at all.
         for gi in 0..index.groups.len() {
             if !expr.may_match_group(&index.groups[gi], &index.dict) {
@@ -660,7 +779,7 @@ pub fn run_query(
             for row in 0..cols.len() {
                 run.packets_scanned += 1;
                 let (rec, meta) = cols.row(row, &index.dict, &index.ip_dict);
-                if expr.matches(&meta, &rec) {
+                if expr.matches(&meta, &rec, &[]) {
                     run.matched += 1;
                     if !on_match(&rec, &meta) {
                         return Ok(run);
@@ -694,7 +813,7 @@ pub fn run_query(
         file.for_each_packet_from(start, snap, |rec, data| {
             let meta = crate::dissect::dissect(rec.linktype, data);
             run.packets_scanned += 1;
-            if expr.matches(&meta, &rec) {
+            if expr.matches(&meta, &rec, data) {
                 run.matched += 1;
                 if !on_match(&rec, &meta) {
                     stop = true;
@@ -771,6 +890,25 @@ mod tests {
         assert!(parse("port in {80, 443, 8000-8100}").is_ok());
         assert!(parse("ip == fe80::/10").is_ok());
         assert!(parse("port < 80-443").is_err()); // ranges only with == / != / in
+    }
+
+    #[test]
+    fn parse_contains() {
+        assert!(matches!(
+            parse(r#"data contains "GET / HTTP""#),
+            Ok(Expr::Cmp(Field::Data, CmpOp::Eq, Value::Bytes { case_insensitive: true, .. }))
+        ));
+        assert!(matches!(
+            parse("data contains 47:45:54"),
+            Ok(Expr::Cmp(Field::Data, CmpOp::Eq, Value::Bytes { case_insensitive: false, pat }))
+                if pat == vec![0x47, 0x45, 0x54]
+        ));
+        assert!(parse("payload contains \"x\"").is_ok()); // alias
+        assert!(parse("bytes contains \"x\"").is_ok()); // alias
+        assert!(parse("port contains \"x\"").is_err()); // contains is data-only
+        assert!(parse("data == \"x\"").is_err()); // data is contains-only
+        assert!(parse("data contains zz:zz").is_err()); // bad hex
+        assert!(parse("proto == tcp && data contains \"a\"").is_ok());
     }
 
     #[test]

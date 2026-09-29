@@ -14,3 +14,4 @@ crossbeam-channel = { workspace = true }
 ahash = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+yaml-rust2 = { workspace = true }

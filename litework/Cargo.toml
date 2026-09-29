@@ -4,6 +4,8 @@ members = [
     "crates/litework-core",
     "crates/litework-capture",
     "crates/litework",
+    "crates/litework-pack",
+    "crates/lwz",
 ]
 
 [workspace.package]
@@ -17,6 +19,8 @@ pcap-parser = "0.16"
 etherparse = "0.16"
 memmap2 = "0.9"
 lz4_flex = "0.11"
+lzma-rust2 = "0.19"
+base64 = "0.22"
 crossbeam-channel = "0.5"
 ahash = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -26,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
+yaml-rust2 = "0.13"
 
 [profile.release]
 lto = "thin"

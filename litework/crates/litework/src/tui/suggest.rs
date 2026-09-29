@@ -25,6 +25,7 @@ const FIELDS: &[(&str, &str)] = &[
     ("ethertype", "ethertype number, e.g. 0x0806"),
     ("vlan", "VLAN id"),
     ("len", "packet length (bytes)"),
+    ("data", "raw packet bytes — data contains \"text\" or data contains aa:bb:cc"),
 ];
 
 const OPERATORS: &[(&str, &str)] = &[
@@ -35,6 +36,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("<", "less than (numbers)"),
     (">=", "at least"),
     ("<=", "at most"),
+    ("contains", "search raw bytes (data field only): \"text\" or aa:bb:cc"),
 ];
 
 const PROTOS: &[&str] = &[
@@ -94,7 +96,7 @@ fn context(before: &str) -> Ctx {
             .cloned()
     };
     match toks.last().map(|s| s.as_str()) {
-        Some("==" | "!=" | "<" | ">" | "<=" | ">=" | "in" | "{" | ",") => {
+        Some("==" | "!=" | "<" | ">" | "<=" | ">=" | "in" | "contains" | "{" | ",") => {
             match field_of(&toks) {
                 Some(f) => Ctx::Value(f),
                 None => Ctx::Field,
@@ -239,17 +241,21 @@ pub fn help_lines() -> Vec<(&'static str, &'static str)> {
         ("  port  sport  dport", "443 · range 5900-5910"),
         ("  proto", "tcp udp icmp arp lldp goose ... any IANA protocol keyword, or a number"),
         ("  ethertype  vlan  len", "numbers (0x hex ok) · ranges lo-hi"),
+        ("  data", "raw frame bytes — Ctrl+F-style search"),
         ("", ""),
         ("OPERATORS", ""),
         ("  ==  !=", "equals / not equals (values, ranges, wildcards)"),
         ("  <  >  <=  >=", "numeric comparison"),
         ("  in {a, b, c}", "any of — sets can mix values and ranges"),
+        ("  contains", "data contains \"text\" (case-insensitive) or data contains aa:bb:cc (exact hex)"),
         ("  &&  ||  !  ( )", "and, or, not, grouping"),
         ("", ""),
         ("EXAMPLES", ""),
         ("  ip == 10.10.*.180 && port == 5900-5910", ""),
         ("  mac == aa:bb:* && proto in {tcp, udp}", ""),
         ("  ip_src == 192.168.1.0/24 && !(proto == arp)", ""),
+        ("  data contains \"password\"", ""),
+        ("  proto == tcp && data contains aa:bb:cc:dd", ""),
         ("", ""),
         ("KEYS", ""),
         ("  tab / ↓↑", "accept / choose completion   ·   enter: apply   esc: cancel"),

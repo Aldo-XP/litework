@@ -34,7 +34,7 @@ fn count_bruteforce(file: &PcapFile, expr: &str) -> u64 {
     let mut n = 0;
     file.for_each_packet(|rec, data| {
         let meta = litework_core::dissect::dissect(rec.linktype, data);
-        if e.matches(&meta, &rec) {
+        if e.matches(&meta, &rec, data) {
             n += 1;
         }
         true
@@ -99,6 +99,32 @@ fn queries_match_ground_truth() {
     assert_eq!(count(&file, &index, "len > 10000"), 0);
     assert_eq!(count(&file, &index, "mac == 11:22:33:44:55:66"), 0);
     assert_eq!(count(&file, &index, "ip == 8.8.8.8"), 0);
+}
+
+#[test]
+fn data_contains_ground_truth() {
+    let bytes = to_pcap(&standard_frames());
+    // Case-insensitive string search.
+    let (file, index) = build("data.pcap", &bytes);
+    assert_eq!(count(&file, &index, "data contains \"hello\""), 40);
+    assert_eq!(count(&file, &index, "data contains \"HELLO\""), 40); // case-insensitive
+    assert_eq!(count(&file, &index, "data contains \"dnsq\""), 25);
+    assert_eq!(count(&file, &index, "data contains \"nope\""), 0);
+    assert_eq!(
+        count(&file, &index, "data contains \"hello\" && proto == tcp"),
+        40
+    );
+    // Exact hex-byte search: b"hello" == 68:65:6c:6c:6f.
+    assert_eq!(count(&file, &index, "data contains 68:65:6c:6c:6f"), 40);
+    assert_eq!(count(&file, &index, "data contains 68:65:6c:6c:6e"), 0);
+    assert_eq!(count_bruteforce(&file, "data contains \"hello\""), 40);
+
+    // A `data contains` filter must bypass the column store (it has no raw
+    // payload bytes) and rescan real bytes even when a sidecar is present.
+    let (sfile, sidx) = build_sidecar("data_sc.pcap", &bytes);
+    assert!(sidx.sidecar.is_some());
+    assert_eq!(count(&sfile, &sidx, "data contains \"hello\""), 40);
+    assert_eq!(count(&sfile, &sidx, "data contains \"dnsq\""), 25);
 }
 
 #[test]

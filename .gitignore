@@ -1,6 +1,6 @@
-# build output
-/target/
-/dist/
+# build output (matches at any depth — the project lives under litework/)
+target/
+dist/
 
 # LiteWork runtime artifacts
 *.lwix

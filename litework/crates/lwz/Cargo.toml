@@ -1,0 +1,15 @@
+[package]
+name = "lwz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "lwz: shrink pcap / bbframe NDJSON captures far below xz, losslessly"
+
+[[bin]]
+name = "lwz"
+path = "src/main.rs"
+
+[dependencies]
+litework-pack = { path = "../litework-pack" }
+clap = { workspace = true }
+anyhow = { workspace = true }

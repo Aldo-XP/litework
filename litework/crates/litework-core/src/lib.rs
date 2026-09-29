@@ -5,11 +5,13 @@
 //! prunes to the few file regions that can match, re-reading raw bytes from
 //! the mmap on demand. The capture itself is never loaded into memory.
 
+pub mod annotate;
 pub mod columns;
 pub mod dissect;
 pub mod format;
 pub mod hist;
 pub mod index;
+pub mod kaitai;
 pub mod pcapout;
 pub mod sidecar;
 pub mod query;
